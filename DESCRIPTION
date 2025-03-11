@@ -1,9 +1,9 @@
 Package: AFDIP
-Title: What the Package Does (One Line, Title Case)
+Title: The AFDIP package contains the functions used for analyzing TMT datasets recorded by Above-Filter Digestion Proteomics technique.
 Version: 0.0.0.9000
 Authors@R: 
-    person("First", "Last", , "first.last@example.com", role = c("aut", "cre"))
-Description: What the package does (one paragraph).
+    person("Hassan", "Gharibi", , "hassan.gharibi@ki.se", role = c("aut", "cre"))
+Description: Proteomics data analyzer for AFDIP technique.
 License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a
     license
 Encoding: UTF-8
