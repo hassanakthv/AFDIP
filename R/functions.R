@@ -1,0 +1,218 @@
+##Required packages
+
+require(dplyr)
+require(tidyr)
+require(tidyverse)
+require(ggplot2)
+require(ggrepel)
+require(broom)
+require(polynom)
+require(metap)
+
+
+## Normalization based on the total intensity of each column
+Sum_Normalization <- function(x, dff_){
+  
+  
+  for (col in 1:ncol(x)){
+    
+    dff <- x[,col]/sum(x[,col], na.rm = T)
+    dff_ <- bind_cols(dff_, dff)
+    
+  }
+  
+  return(dff_)
+}
+
+## Ratio and p value calculation for non-log data
+rp_calc_nonlog <- function(x, rep = 3) {
+  n <- seq(1, ncol(x), rep)
+  mx <- as.matrix(x)
+  
+  res <- lapply(1:nrow(mx), function(j) {
+    row_vals <- mx[j, ]
+    medians <- sapply(n, function(i) median(row_vals[i:(i + rep - 1)]))
+    
+    ratios <- sapply(n, function(i) {
+      median(row_vals[i:(i + rep - 1)]) / median(row_vals[1:rep])
+    })
+    
+    p_values <- sapply(n, function(i) {
+      t.test(row_vals[1:rep], row_vals[i:(i + rep - 1)], paired = FALSE)$p.value
+    })
+    
+    c(row_vals, medians, ratios, p_values)
+  })
+  
+  df_result <- as.data.frame(do.call(rbind, res))
+  colnames(df_result) <- c(colnames(x), paste0(colnames(x)[n], "_median"), paste0(colnames(x)[n], "_ratio"), paste0(colnames(x)[n], "_p.value"))
+  
+  return(df_result)
+}
+
+## Standardize function
+standardize <- function(z) {
+  rowmed <- apply(z, 1, median, na.rm = TRUE)
+  rowmad <- apply(z, 1, mad, na.rm = TRUE)  # Median absolute deviation
+  return(sweep(sweep(z, 1, rowmed, "-"), 1, rowmad, "/"))
+}
+
+## Generating name of the samples
+Name_Generator <- function(xlist, rep = 3) {
+  unlist(lapply(xlist, function(x) paste0(x, "_Rep", 1:rep)))
+}
+
+## Centroid function
+Centroid <- function(x, func) {
+  t_func <- tidy(func)
+  poly_coeffs <- as.numeric(t_func[, 2])
+  poly_function <- function(x) sum(poly_coeffs * x^(0:(length(poly_coeffs) - 1)))
+  poly_function_x <- function(x) x * poly_function(x)
+  
+  A <- integrate(poly_function, min(x), max(x))$value
+  x_centroid <- integrate(poly_function_x, min(x), max(x))$value / A
+  return(x_centroid)
+}
+
+## Normalization of samples based on the best fitted model
+Normalize_Based_On_Model <- function(res, degree = 3) {
+  ss <- colSums(res[, 12:59])
+  batch_fit <- seq(1, 48, 8)
+  Adj <- numeric(48)
+  
+  for (i in batch_fit) {
+    x <- 1:8
+    y <- ss[i:(i + 7)]
+    fitmodel <- lm(y ~ poly(x, degree))
+    Adj[i:(i + 7)] <- predict(fitmodel, newdata = data.frame(x = x))
+  }
+  
+  Adjj <- Adj / ss
+  res_norm <- res[, 12:59] * Adjj
+  res_norm <- cbind(res[, 1:11], res_norm)
+  
+  return(res_norm)
+}
+
+Compute_Shift_Analysis <- function(res_norm) {
+  xx <- 1:48
+  result <- data.frame()
+  rep_res <- data.frame()
+  
+  for (i in 1:nrow(res_norm)) {
+    test <- as.numeric(res_norm[i, 12:59])
+    tmt_i <- seq(1, 48, 16)
+    
+    tt_df <- do.call(rbind, lapply(tmt_i, function(j) {
+      tmt_end <- j + 15
+      tt_test <- data.frame(
+        Hour = rep(1:8, 2),
+        Sample = rep(c("Control", "Treated"), each = 8),
+        Intensity = test[j:tmt_end]
+      )
+      
+      Control_Ratio <- tt_test %>% filter(Sample == "Control") %>% pull(Intensity) / max(tt_test %>% filter(Sample == "Control") %>% pull(Intensity))
+      Treat_Ratio <- tt_test %>% filter(Sample == "Treated") %>% pull(Intensity) / max(tt_test %>% filter(Sample == "Treated") %>% pull(Intensity))
+      
+      data.frame(
+        Hour = rep(1:8, 2),
+        Sample = rep(c("Control", "Treated"), each = 8),
+        Ratio = c(Control_Ratio, Treat_Ratio),
+        Rep = j
+      )
+    }))
+    
+    model_results <- lapply(unique(tt_df$Sample), function(ns) {
+      model <- try(lm(formula = Ratio ~ poly(Hour, 4, raw = TRUE), data = filter(tt_df, Sample == ns)), silent = TRUE)
+      if (!inherits(model, "try-error")) {
+        return(data.frame(
+          Sample = ns,
+          T_centroid = Centroid(x = 1:8, func = model),
+          R2 = rSquared(model, filter(tt_df, Sample == ns)$Ratio)
+        ))
+      } else {
+        return(data.frame(Sample = ns, T_centroid = 0, R2 = 0))
+      }
+    })
+    
+    model_df <- do.call(rbind, model_results)
+    names(model_df) <- paste0(names(model_df), "__", model_df$Sample)
+    model_df$Sample <- NULL
+    
+    result <- rbind(result, cbind(res_norm[i, 1:11], model_df))
+  }
+  
+  return(result)
+}
+
+
+#' Calculate Fisher's Combined p-value
+#'
+#' This function takes a data frame containing p-values and computes Fisher's combined p-value
+#' for each unique gene using the `sumlog()` function from the `metap` package.
+#'
+#' @param data A data frame containing at least two columns: "Gene.names" and a column with p-values.
+#' @param pval_col A string indicating the name of the column containing p-values. Default is `"p.value"`.
+#'
+#' @return A data frame with `Gene.names`, Fisher's combined p-value, and the number of peptides per gene.
+#' @export
+#'
+#' @examples
+#' df <- data.frame(Gene.names = rep(c("Gene1", "Gene2"), each = 3),
+#'                  p.value = c(0.01, 0.02, 0.05, 0.001, 0.02, 0.03))
+#' calculate_fisher_pvalues(df, "p.value")
+#'
+calculate_fisher_pvalues <- function(data, pval_col = "p.value") {
+  data %>%
+    group_by(Gene.names) %>%
+    summarise(
+      p.value.fisher = ifelse(n() == 1, first(!!sym(pval_col)), sumlog(!!sym(pval_col))$p),
+      n = n()
+    ) %>%
+    ungroup()
+}
+
+## BH pvalue correction
+apply_bh_correction <- function(data, pval_col = "p.value.fisher") {
+  data %>%
+    mutate(bh_adjusted_p = p.adjust(!!sym(pval_col), method = "BH"))
+}
+
+## Calculate protein mean shift
+compute_mean_shift <- function(peptide_data) {
+  peptide_data %>%
+    group_by(Gene.names) %>%
+    summarise(Mean_Mean_shift = mean(Mean_Shift, na.rm = TRUE)) %>%
+    ungroup()
+}
+
+merge_fisher_and_shifts <- function(fisher_data, shift_data) {
+  fisher_data %>%
+    left_join(shift_data, by = "Gene.names")
+}
+
+generate_volcano_plot <- function(data, x_col = "Mean_Mean_shift", y_col = "p.value.fisher",
+                                  log_threshold = 0.05, shift_cutoff = 0.5, output_file = "volcano_plot.png") {
+  
+  data <- data %>%
+    mutate(neg_log10_p = -log10(!!sym(y_col)),
+           significant = abs(!!sym(x_col)) > shift_cutoff & neg_log10_p > -log10(log_threshold))
+  
+  volcano_plot <- ggplot(data, aes(x = !!sym(x_col), y = neg_log10_p)) +
+    geom_point(aes(color = significant), alpha = 0.6) +
+    geom_hline(yintercept = -log10(log_threshold), linetype = "dashed", color = "red") +
+    geom_vline(xintercept = c(-shift_cutoff, shift_cutoff), linetype = "dashed", color = "red") +
+    scale_color_manual(values = c("black", "red")) +
+    labs(x = "Mean CoG Shift (Protein)", y = "-log10(p-value)", title = "Volcano Plot - Protein Level MTX") +
+    theme_minimal() +
+    theme(legend.position = "none",
+          panel.background = element_rect(fill = "white", colour = "black"),
+          panel.grid.major = element_line(colour = "grey90"),
+          panel.grid.minor = element_line(colour = "grey90")) +
+    geom_text_repel(data = subset(data, significant == TRUE),
+                    aes(label = Gene.names),
+                    size = 3, box.padding = 0.5, point.padding = 0.1, force = 1, max.overlaps = Inf)
+  
+  print(volcano_plot)
+  ggsave(output_file, volcano_plot, width = 6, height = 5, dpi = 300)
+}
